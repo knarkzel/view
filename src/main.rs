@@ -1,30 +1,30 @@
+use ansi_to_tui::IntoText;
 use anyhow::{anyhow, bail, Result};
 use crossterm::{
     event::{self, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use duct::cmd;
+use std::io::prelude::*;
+use std::io::BufReader;
 use std::{
     sync::{mpsc, Arc, Mutex},
     thread,
-    time::Duration,
 };
-use std::io::prelude::*;
-use std::io::BufReader;
 use tui::{
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout},
-    widgets::Block,
+    layout::{Alignment, Constraint, Direction, Layout},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
 };
-use duct::cmd;
 
 fn main() -> Result<()> {
     // Check args
     if std::env::args().skip(1).count() < 2 {
         bail!("view <left> <right>");
     }
-    
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -49,7 +49,9 @@ fn main() -> Result<()> {
 
 #[derive(Clone, Default)]
 struct State {
+    left_title: String,
     left: String,
+    right_title: String,
     right: String,
 }
 
@@ -61,7 +63,11 @@ enum Event {
 fn update<B: Backend + Send>(terminal: &mut Terminal<B>) -> Result<()> {
     // State
     let (tx, rx) = mpsc::channel::<Event>();
-    let state = Arc::new(Mutex::new(State::default()));
+    let state = Arc::new(Mutex::new(State {
+        left_title: std::env::args().skip(1).nth(0).unwrap(),
+        right_title: std::env::args().skip(1).nth(1).unwrap(),
+        ..Default::default()
+    }));
 
     // Left screen
     let left_tx = tx.clone();
@@ -84,6 +90,7 @@ fn update<B: Backend + Send>(terminal: &mut Terminal<B>) -> Result<()> {
                 return;
             };
             lock.left.push_str(&line);
+            lock.left.push('\n');
             let Ok(_) = left_tx.send(Event::Draw) else {
                 return;
             };
@@ -111,6 +118,7 @@ fn update<B: Backend + Send>(terminal: &mut Terminal<B>) -> Result<()> {
                 return;
             };
             lock.right.push_str(&line);
+            lock.right.push('\n');
             let Ok(_) = right_tx.send(Event::Draw) else {
                 return;
             };
@@ -134,13 +142,15 @@ fn update<B: Backend + Send>(terminal: &mut Terminal<B>) -> Result<()> {
         match rx.recv() {
             Ok(Event::Draw) => {
                 terminal.draw(|f| {
+                    let size = f.size();
+
                     // Declare layout
                     let chunks = Layout::default()
                         .direction(Direction::Horizontal)
                         .constraints(
                             [Constraint::Percentage(50), Constraint::Percentage(50)].as_ref(),
                         )
-                        .split(f.size());
+                        .split(size);
 
                     // Get output
                     let Ok(lock) = state.lock() else {
@@ -148,12 +158,34 @@ fn update<B: Backend + Send>(terminal: &mut Terminal<B>) -> Result<()> {
                     };
 
                     // Draw left screen
-                    let block = Block::default().title(lock.left.clone());
-                    f.render_widget(block, chunks[0]);
+                    let block = Block::default()
+                        .borders(Borders::ALL)
+                        .title(lock.left_title.clone())
+                        .title_alignment(Alignment::Center);
+                    let lines = lock.left.into_text().unwrap().lines;
+                    let amount = lines.len();
+                    let part = lines
+                        .into_iter()
+                        .skip(amount.saturating_sub(size.height as usize + 2))
+                        .take(size.height as usize)
+                        .collect::<Vec<_>>();
+                    let text = Paragraph::new(part).block(block).wrap(Wrap { trim: true });
+                    f.render_widget(text, chunks[0]);
 
                     // Draw right screen
-                    let block = Block::default().title(lock.right.clone());
-                    f.render_widget(block, chunks[1]);
+                    let block = Block::default()
+                        .borders(Borders::ALL)
+                        .title(lock.right_title.clone())
+                        .title_alignment(Alignment::Center);
+                    let lines = lock.right.into_text().unwrap().lines;
+                    let amount = lines.len();
+                    let part = lines
+                        .into_iter()
+                        .skip(amount.saturating_sub(size.height as usize + 2))
+                        .take(size.height as usize)
+                        .collect::<Vec<_>>();
+                    let text = Paragraph::new(part).block(block).wrap(Wrap { trim: true });
+                    f.render_widget(text, chunks[1]);
                 })?;
             }
             Ok(Event::Exit) => return Ok(()),

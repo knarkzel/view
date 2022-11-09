@@ -6,4 +6,4 @@ Run two commands concurrently in split view. Install with `cargo install --git h
 view <left command> <right command>
 ```
 
-![Example](./example.webp)
+![Demo](./demo.webp)

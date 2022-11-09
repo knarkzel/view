@@ -1,6 +1,9 @@
 # view
 
-Runs two commands concurrently in split view.
-Usage: `view <left command> <right command>`
+Run two commands concurrently in split view. Install with `cargo install --git https://github.com/knarkzel/view`
+
+```
+view <left command> <right command>
+```
 
 ![Example](./example.webp)

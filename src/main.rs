@@ -1,18 +1,30 @@
-use anyhow::{Result, bail, anyhow};
+use anyhow::{anyhow, bail, Result};
 use crossterm::{
     event::{self, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use std::{
+    sync::{mpsc, Arc, Mutex},
+    thread,
+    time::Duration,
+};
+use std::io::prelude::*;
+use std::io::BufReader;
 use tui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout},
     widgets::Block,
-    Frame, Terminal,
+    Terminal,
 };
-use std::{sync::{mpsc, Arc, Mutex}, thread, time::Duration};
+use duct::cmd;
 
 fn main() -> Result<()> {
+    // Check args
+    if std::env::args().skip(1).count() < 2 {
+        bail!("view <left> <right>");
+    }
+    
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -25,10 +37,7 @@ fn main() -> Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen,)?;
     terminal.show_cursor()?;
 
     if let Err(error) = result {
@@ -51,49 +60,71 @@ enum Event {
 
 fn update<B: Backend + Send>(terminal: &mut Terminal<B>) -> Result<()> {
     // State
-    let commands = std::env::args().skip(1).take(2).collect::<Vec<_>>();
-    let [left, right] = commands.as_slice() else {
-        bail!("view <left> <right>");
-    };
-    let state = Arc::new(Mutex::new(State::default()));
     let (tx, rx) = mpsc::channel::<Event>();
+    let state = Arc::new(Mutex::new(State::default()));
 
     // Left screen
     let left_tx = tx.clone();
     let left_state = state.clone();
     let left_thread = thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_millis(1000));
+        let Some(left) = std::env::args().skip(1).nth(0) else {
+            return;
+        };
+        let split = left.split_whitespace().collect::<Vec<_>>();
+        let [command, args @ ..] = split.as_slice() else {
+            return;
+        };
+        let cmd = cmd(*command, args);
+        let Ok(reader) = cmd.stderr_to_stdout().reader() else {
+            return;
+        };
+        let mut lines = BufReader::new(reader).lines();
+        while let Some(Ok(line)) = lines.next() {
             let Ok(mut lock) = left_state.lock() else {
-                continue;
+                return;
             };
-            lock.left.push_str("left\n");
-            left_tx.send(Event::Draw).unwrap();
+            lock.left.push_str(&line);
+            let Ok(_) = left_tx.send(Event::Draw) else {
+                return;
+            };
         }
     });
 
     // Right screen
     let right_tx = tx.clone();
     let right_state = state.clone();
-    let right_thread = thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_millis(1000));
+    let right_thread = thread::spawn(move || loop {
+        let Some(right) = std::env::args().skip(1).nth(1) else {
+            return;
+        };
+        let split = right.split_whitespace().collect::<Vec<_>>();
+        let [command, args @ ..] = split.as_slice() else {
+            return;
+        };
+        let cmd = cmd(*command, args);
+        let Ok(reader) = cmd.stderr_to_stdout().reader() else {
+            return;
+        };
+        let mut lines = BufReader::new(reader).lines();
+        while let Some(Ok(line)) = lines.next() {
             let Ok(mut lock) = right_state.lock() else {
-                continue;
+                return;
             };
-            lock.right.push_str("right\n");
-            right_tx.send(Event::Draw).unwrap();
+            lock.right.push_str(&line);
+            let Ok(_) = right_tx.send(Event::Draw) else {
+                return;
+            };
         }
     });
 
     // Input thread
     let input_tx = tx.clone();
-    let input_thread = thread::spawn(move || {
-        loop {
-            if let Ok(crossterm::event::Event::Key(key)) = event::read() {
-                if let KeyCode::Char('q') = key.code {
-                    input_tx.send(Event::Exit).unwrap();
-                }
+    let input_thread = thread::spawn(move || loop {
+        if let Ok(crossterm::event::Event::Key(key)) = event::read() {
+            if let KeyCode::Char('q') = key.code {
+                let Ok(_) = input_tx.send(Event::Exit) else {
+                    return;
+                };
             }
         }
     });
@@ -106,14 +137,16 @@ fn update<B: Backend + Send>(terminal: &mut Terminal<B>) -> Result<()> {
                     // Declare layout
                     let chunks = Layout::default()
                         .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+                        .constraints(
+                            [Constraint::Percentage(50), Constraint::Percentage(50)].as_ref(),
+                        )
                         .split(f.size());
 
                     // Get output
                     let Ok(lock) = state.lock() else {
                         return;
                     };
-                    
+
                     // Draw left screen
                     let block = Block::default().title(lock.left.clone());
                     f.render_widget(block, chunks[0]);
@@ -122,16 +155,22 @@ fn update<B: Backend + Send>(terminal: &mut Terminal<B>) -> Result<()> {
                     let block = Block::default().title(lock.right.clone());
                     f.render_widget(block, chunks[1]);
                 })?;
-            },
+            }
             Ok(Event::Exit) => return Ok(()),
             Err(_) => break 'outer,
         }
     }
 
     // Wait for threads
-    left_thread.join().map_err(|_| anyhow!("Joining left thread failed"))?;
-    right_thread.join().map_err(|_| anyhow!("Joining right thread failed"))?;
-    input_thread.join().map_err(|_| anyhow!("Joining input thread failed"))?;
+    left_thread
+        .join()
+        .map_err(|_| anyhow!("Joining left thread failed"))?;
+    right_thread
+        .join()
+        .map_err(|_| anyhow!("Joining right thread failed"))?;
+    input_thread
+        .join()
+        .map_err(|_| anyhow!("Joining input thread failed"))?;
 
     Ok(())
 }

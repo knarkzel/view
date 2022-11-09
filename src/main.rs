@@ -1,6 +1,6 @@
 use anyhow::{Result, bail, anyhow};
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -10,7 +10,7 @@ use tui::{
     widgets::Block,
     Frame, Terminal,
 };
-use std::{thread, sync::{Arc, Mutex}, time::Duration};
+use std::{sync::{mpsc, Arc, Mutex}, thread, time::Duration};
 
 fn main() -> Result<()> {
     // Setup terminal
@@ -44,6 +44,11 @@ struct State {
     right: String,
 }
 
+enum Event {
+    Exit,
+    Draw,
+}
+
 fn update<B: Backend + Send>(terminal: &mut Terminal<B>) -> Result<()> {
     // State
     let commands = std::env::args().skip(1).take(2).collect::<Vec<_>>();
@@ -51,8 +56,10 @@ fn update<B: Backend + Send>(terminal: &mut Terminal<B>) -> Result<()> {
         bail!("view <left> <right>");
     };
     let state = Arc::new(Mutex::new(State::default()));
+    let (tx, rx) = mpsc::channel::<Event>();
 
-    // Threads
+    // Left screen
+    let left_tx = tx.clone();
     let left_state = state.clone();
     let left_thread = thread::spawn(move || {
         loop {
@@ -61,8 +68,12 @@ fn update<B: Backend + Send>(terminal: &mut Terminal<B>) -> Result<()> {
                 continue;
             };
             lock.left.push_str("left\n");
+            left_tx.send(Event::Draw).unwrap();
         }
     });
+
+    // Right screen
+    let right_tx = tx.clone();
     let right_state = state.clone();
     let right_thread = thread::spawn(move || {
         loop {
@@ -71,35 +82,56 @@ fn update<B: Backend + Send>(terminal: &mut Terminal<B>) -> Result<()> {
                 continue;
             };
             lock.right.push_str("right\n");
+            right_tx.send(Event::Draw).unwrap();
         }
     });
 
+    // Input thread
+    let input_tx = tx.clone();
+    let input_thread = thread::spawn(move || {
+        loop {
+            if let Ok(crossterm::event::Event::Key(key)) = event::read() {
+                if let KeyCode::Char('q') = key.code {
+                    input_tx.send(Event::Exit).unwrap();
+                }
+            }
+        }
+    });
+
+    // Main loop
     'outer: loop {
-        terminal.draw(|f| {
-            // Declare layout
-            let chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-                .split(f.size());
+        match rx.recv() {
+            Ok(Event::Draw) => {
+                terminal.draw(|f| {
+                    // Declare layout
+                    let chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+                        .split(f.size());
 
-            // Get output
-            let Ok(lock) = state.lock() else {
-                return;
-            };
-            
-            // Draw left screen
-            let block = Block::default().title(lock.left.clone());
-            f.render_widget(block, chunks[0]);
+                    // Get output
+                    let Ok(lock) = state.lock() else {
+                        return;
+                    };
+                    
+                    // Draw left screen
+                    let block = Block::default().title(lock.left.clone());
+                    f.render_widget(block, chunks[0]);
 
-            // Draw right screen
-            let block = Block::default().title(lock.right.clone());
-            f.render_widget(block, chunks[1]);
-        })?;
+                    // Draw right screen
+                    let block = Block::default().title(lock.right.clone());
+                    f.render_widget(block, chunks[1]);
+                })?;
+            },
+            Ok(Event::Exit) => return Ok(()),
+            Err(_) => break 'outer,
+        }
     }
 
     // Wait for threads
-    left_thread.join().map_err(|_| anyhow!("Joining thread failed"))?;
-    right_thread.join().map_err(|_| anyhow!("Joining thread failed"))?;
+    left_thread.join().map_err(|_| anyhow!("Joining left thread failed"))?;
+    right_thread.join().map_err(|_| anyhow!("Joining right thread failed"))?;
+    input_thread.join().map_err(|_| anyhow!("Joining input thread failed"))?;
 
     Ok(())
 }

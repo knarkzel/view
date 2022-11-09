@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, anyhow};
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
@@ -44,7 +44,7 @@ struct State {
     right: String,
 }
 
-fn update<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
+fn update<B: Backend + Send>(terminal: &mut Terminal<B>) -> Result<()> {
     // State
     let commands = std::env::args().skip(1).take(2).collect::<Vec<_>>();
     let [left, right] = commands.as_slice() else {
@@ -58,7 +58,7 @@ fn update<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
         loop {
             thread::sleep(Duration::from_millis(1000));
             let Ok(mut lock) = left_state.lock() else {
-                return;
+                continue;
             };
             lock.left.push_str("left\n");
         }
@@ -68,43 +68,38 @@ fn update<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
         loop {
             thread::sleep(Duration::from_millis(1000));
             let Ok(mut lock) = right_state.lock() else {
-                return;
+                continue;
             };
-            lock.right.push_str("left\n");
+            lock.right.push_str("right\n");
         }
     });
 
-    // Logic, these threads block
-    left_thread.join().unwrap();
-    right_thread.join().unwrap();
-    
-    loop {
-        terminal.draw(|f| screen(f, &state))?;
+    'outer: loop {
+        terminal.draw(|f| {
+            // Declare layout
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+                .split(f.size());
 
-        if let Event::Key(key) = event::read()? {
-            if let KeyCode::Char('q') = key.code {
-                return Ok(());
-            }
-        }
+            // Get output
+            let Ok(lock) = state.lock() else {
+                return;
+            };
+            
+            // Draw left screen
+            let block = Block::default().title(lock.left.clone());
+            f.render_widget(block, chunks[0]);
+
+            // Draw right screen
+            let block = Block::default().title(lock.right.clone());
+            f.render_widget(block, chunks[1]);
+        })?;
     }
-}
 
-fn screen<B: Backend>(f: &mut Frame<B>, state: &Arc<Mutex<State>>) {
-    let Ok(lock) = state.lock() else {
-        return;
-    };
+    // Wait for threads
+    left_thread.join().map_err(|_| anyhow!("Joining thread failed"))?;
+    right_thread.join().map_err(|_| anyhow!("Joining thread failed"))?;
 
-    // Declare layout
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-        .split(f.size());
-
-    // Draw left screen
-    let block = Block::default().title(lock.left.clone());
-    f.render_widget(block, chunks[0]);
-
-    // Draw right screen
-    let block = Block::default().title(lock.right.clone());
-    f.render_widget(block, chunks[1]);
+    Ok(())
 }
